@@ -2525,7 +2525,7 @@ def process_docx(font_families, options):
         files.get("word/styles.xml")
     )
 
-        report = {
+    report = {
         "xmlPartsProcessed": 0,
         "wordRuns": 0,
         "wordRunProperties": 0,
