@@ -865,14 +865,211 @@ def ensure_paragraph_properties(paragraph):
 
     return ppr
 
+def insert_ppr_child_ordered(ppr, child):
+    # ترتیب استاندارد فرزندان w:pPr در WordprocessingML
+    order = {
+        W + "pStyle": 0,
+        W + "keepNext": 1,
+        W + "keepLines": 2,
+        W + "pageBreakBefore": 3,
+        W + "framePr": 4,
+        W + "widowControl": 5,
+        W + "numPr": 6,
+        W + "suppressLineNumbers": 7,
+        W + "pBdr": 8,
+        W + "shd": 9,
+        W + "tabs": 10,
+        W + "suppressAutoHyphens": 11,
+        W + "kinsoku": 12,
+        W + "wordWrap": 13,
+        W + "overflowPunct": 14,
+        W + "topLinePunct": 15,
+        W + "autoSpaceDE": 16,
+        W + "autoSpaceDN": 17,
+        W + "bidi": 18,
+        W + "adjustRightInd": 19,
+        W + "snapToGrid": 20,
+        W + "spacing": 21,
+        W + "ind": 22,
+        W + "contextualSpacing": 23,
+        W + "mirrorIndents": 24,
+        W + "suppressOverlap": 25,
+        W + "jc": 26,
+        W + "textDirection": 27,
+        W + "textAlignment": 28,
+        W + "outlineLvl": 29,
+        W + "divId": 30,
+        W + "cnfStyle": 31,
+        W + "rPr": 32,
+        W + "sectPr": 33,
+        W + "pPrChange": 34,
+    }
+
+    child_order = order.get(child.tag)
+
+    if child_order is None:
+        ppr.append(child)
+        return
+
+    for index, existing in enumerate(ppr):
+        existing_order = order.get(existing.tag)
+
+        if (
+            existing_order is not None
+            and existing_order > child_order
+        ):
+            ppr.insert(index, child)
+            return
+
+    ppr.append(child)
+
+
+def get_style_paragraph_property(paragraph, style_index, tag):
+    style_id = paragraph_style_id(
+        paragraph,
+        style_index
+    )
+
+    for info in style_chain(style_index, style_id):
+        ppr = info.get("ppr")
+
+        if ppr is None:
+            continue
+
+        element = ppr.find(tag)
+
+        if element is not None:
+            return element
+
+    return None
+
+
+def set_ppr_on_off(paragraph, tag, enabled):
+    ppr = ensure_paragraph_properties(paragraph)
+    element = ppr.find(tag)
+
+    if element is None:
+        element = etree.Element(tag)
+        insert_ppr_child_ordered(ppr, element)
+
+    element.set(
+        W + "val",
+        "1" if enabled else "0"
+    )
+
+    return element
+
+
+def apply_advanced_paragraph_controls(
+    document_root,
+    style_index
+):
+    # ویژگی‌های صفحه‌آرایی که باید از Style به پاراگراف منتقل شوند.
+    pagination_tags = (
+        W + "keepNext",
+        W + "keepLines",
+        W + "pageBreakBefore",
+        W + "widowControl",
+    )
+
+    report = {
+        "paragraphsChecked": 0,
+        "widowControlEnabled": 0,
+        "headingKeepNextEnabled": 0,
+        "inheritedControlsMaterialized": 0,
+        "nonHeadingKeepNextPreserved": 0,
+    }
+
+    heading_buckets = (
+        "heading2",
+        "heading3",
+        "heading4",
+    )
+
+    for paragraph in document_root.iter(W_P):
+        report["paragraphsChecked"] += 1
+
+        ppr = paragraph.find(W_PPR)
+
+        # حفظ ویژگی‌های به‌ارث‌رسیده از Style پاراگراف.
+        # ویژگی مستقیم پاراگراف همیشه اولویت دارد.
+        for tag in pagination_tags:
+            if ppr is not None and ppr.find(tag) is not None:
+                continue
+
+            inherited = get_style_paragraph_property(
+                paragraph,
+                style_index,
+                tag
+            )
+
+            if inherited is None:
+                continue
+
+            ppr = ensure_paragraph_properties(paragraph)
+
+            insert_ppr_child_ordered(
+                ppr,
+                copy.deepcopy(inherited)
+            )
+
+            report["inheritedControlsMaterialized"] += 1
+
+        # معادل avoidWidowAndOrphan = true در Google Docs API.
+        # برای همه پاراگراف‌های بدنه، از جمله پاراگراف‌های جدول.
+        set_ppr_on_off(
+            paragraph,
+            W + "widowControl",
+            True
+        )
+
+        report["widowControlEnabled"] += 1
+
+        # مطابق LineSpacing.gs:
+        # Keep with next برای تیترهای سطح ۲ تا ۴.
+        bucket = paragraph_bucket(
+            paragraph,
+            style_index
+        )
+
+        if bucket in heading_buckets:
+            set_ppr_on_off(
+                paragraph,
+                W + "keepNext",
+                True
+            )
+
+            report["headingKeepNextEnabled"] += 1
+
+        # Keep with next سایر پاراگراف‌ها، از جمله مرجع‌های
+        # سلسله‌مراتبی فهرست‌ها، فقط در صورت وجود در سند اصلی حفظ می‌شود.
+        # این ویژگی به تمام پاراگراف‌های فهرست تعمیم داده نمی‌شود.
+        final_ppr = paragraph.find(W_PPR)
+
+        if final_ppr is not None:
+            keep_next = final_ppr.find(W + "keepNext")
+
+            if (
+                keep_next is not None
+                and on_off_value(keep_next)
+                and bucket not in heading_buckets
+            ):
+                report["nonHeadingKeepNextPreserved"] += 1
+
+    return report
+
 
 def set_paragraph_spacing(paragraph, config):
     ppr = ensure_paragraph_properties(paragraph)
 
     spacing = ppr.find(W_SPACING)
 
-    if spacing is None:
-        spacing = etree.SubElement(ppr, W_SPACING)
+        if spacing is None:
+        spacing = etree.Element(W_SPACING)
+    else:
+        ppr.remove(spacing)
+
+    insert_ppr_child_ordered(ppr, spacing)
 
     before = bounded_number(
         config.get("before"),
@@ -2389,7 +2586,18 @@ def process_docx(font_families, options):
                 remove_background_shading(root)
             )
 
+        
         if part_name == "word/document.xml":
+            # ابتدا حفظ و اعمال ویژگی‌های پیشرفته صفحه‌آرایی.
+            # این مرحله مستقل از روشن یا خاموش بودن فاصله‌گذاری است.
+            report["paginationControls"] = (
+                apply_advanced_paragraph_controls(
+                    root,
+                    style_index
+                )
+            )
+
+            # سپس فاصله‌گذاری و حداقل اندازه فونت.
             spacing_report = apply_paragraph_formatting(
                 root,
                 style_index,
@@ -2403,6 +2611,7 @@ def process_docx(font_families, options):
             report["normalRunsRaised"] = (
                 spacing_report["normalRunsRaised"]
             )
+
 
         if part_name == "word/settings.xml":
             files[part_name] = ensure_do_not_expand_shift_return(
@@ -2419,7 +2628,7 @@ def process_docx(font_families, options):
                 root,
                 original_data
             )
-
+        "paginationControls": None,
         report["xmlPartsProcessed"] += 1
 
     # The DOCX export normally contains settings.xml.
@@ -2542,7 +2751,14 @@ def main():
         "Shift+Enter protection:",
         "ENABLED" if report["shiftReturnProtection"] else "NOT SET"
     )
-
+    if report["paginationControls"] is not None:
+        print(
+            "Advanced pagination controls:",
+            json.dumps(
+                report["paginationControls"],
+                ensure_ascii=False
+            )
+        )
     print(
         "Paragraph formatting enabled:",
         get_boolean(options, "paragraphFormatting")
