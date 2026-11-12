@@ -1059,12 +1059,13 @@ def apply_advanced_paragraph_controls(
     return report
 
 
+
 def set_paragraph_spacing(paragraph, config):
     ppr = ensure_paragraph_properties(paragraph)
 
     spacing = ppr.find(W_SPACING)
 
-        if spacing is None:
+    if spacing is None:
         spacing = etree.Element(W_SPACING)
     else:
         ppr.remove(spacing)
@@ -1121,6 +1122,7 @@ def set_paragraph_spacing(paragraph, config):
         "afterAutospacing",
     ):
         spacing.attrib.pop(W + attribute, None)
+
 
 
 def enforce_minimum_normal_font_size(
