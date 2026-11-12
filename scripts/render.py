@@ -1,14 +1,12 @@
 
-import html
 import os
-import re
 import shutil
 import subprocess
 import unicodedata
 import zipfile
-import xml.etree.ElementTree as ET
-
 from pathlib import Path
+
+from lxml import etree
 
 
 SOURCE = Path("input.docx")
@@ -20,30 +18,45 @@ FONT_FILES = [
     Path("IRMitra-Italic.ttf"),
 ]
 
-FONT_DIR = Path.home() / ".local" / "share" / "fonts" / "irmitra"
-
-XML_PARTS = re.compile(
-    r"^word/(?:document|styles|header\d+|footer\d+|"
-    r"footnotes|endnotes|comments)\.xml$"
+FONT_DIR = (
+    Path.home()
+    / ".local"
+    / "share"
+    / "fonts"
+    / "irmitra"
 )
 
-RPR_RE = re.compile(
-    r'<w:rPr(?P<attrs>[^>]*)>(?P<body>.*?)</w:rPr>'
-    r'|<w:rPr(?P<selfattrs>[^>]*)/>',
-    re.DOTALL,
+W_NS = (
+    "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 )
 
-RUN_RE = re.compile(
-    r'<w:r(?=[\s>])(?P<attrs>[^>]*)>'
-    r'(?P<body>.*?)</w:r>',
-    re.DOTALL,
+A_NS = (
+    "http://schemas.openxmlformats.org/drawingml/2006/main"
 )
 
-RFONTS_RE = re.compile(
-    r'<w:rFonts\b[^>]*/\s*>'
-    r'|<w:rFonts\b[^>]*>.*?</w:rFonts>',
-    re.DOTALL,
+M_NS = (
+    "http://schemas.openxmlformats.org/officeDocument/2006/math"
 )
+
+W = "{%s}" % W_NS
+A = "{%s}" % A_NS
+M = "{%s}" % M_NS
+
+W_R = W + "r"
+W_RPR = W + "rPr"
+W_RFonts = W + "rFonts"
+W_SYM = W + "sym"
+
+A_R = A + "r"
+A_RPR = A + "rPr"
+
+A_FONT_ELEMENTS = {
+    A + "latin",
+    A + "ea",
+    A + "cs",
+    A + "font",
+    A + "buFont",
+}
 
 
 def run_command(args):
@@ -57,143 +70,283 @@ def run_command(args):
     return result.stdout.strip()
 
 
-def font_family(font_path):
+def normalize_family(value):
+    return unicodedata.normalize(
+        "NFKC",
+        value
+    ).casefold().strip()
+
+
+def detect_font_family(path):
     output = run_command([
         "fc-scan",
         "--format",
         "%{family}\n",
-        str(font_path),
+        str(path),
     ])
 
     if not output:
         raise RuntimeError(
-            f"Could not read the internal font family: {font_path.name}"
+            "Cannot detect font family: " + path.name
         )
 
-    # Fontconfig may return multiple family aliases.
     family = output.splitlines()[0].split(",")[0].strip()
 
     if not family:
         raise RuntimeError(
-            f"Empty font family name in {font_path.name}"
+            "Empty font family: " + path.name
         )
 
     return family
 
 
-def install_and_check_fonts():
+def install_fonts():
     for path in FONT_FILES:
         if not path.is_file() or path.stat().st_size == 0:
-            raise RuntimeError(f"Missing or empty font file: {path.name}")
+            raise RuntimeError(
+                "Missing or empty font: " + path.name
+            )
 
     families = {
-        path.name: font_family(path)
+        path.name: detect_font_family(path)
         for path in FONT_FILES
     }
 
     normalized = {
-        unicodedata.normalize("NFKC", value).casefold()
+        normalize_family(value)
         for value in families.values()
     }
 
     if len(normalized) != 1:
-        details = "; ".join(
-            f"{name}={family}"
-            for name, family in families.items()
-        )
         raise RuntimeError(
-            "The three TTF files do not declare the same font family. "
-            "Their metadata must be reconciled before rendering. " + details
+            "Regular, Bold and Italic do not share one "
+            "internal font family. Rendering stopped. "
+            + str(families)
         )
 
     family = families[FONT_FILES[0].name]
 
-    FONT_DIR.mkdir(parents=True, exist_ok=True)
+    FONT_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
 
     for source in FONT_FILES:
-        destination = FONT_DIR / source.name
-        shutil.copy2(source, destination)
-        destination.chmod(0o644)
+        target = FONT_DIR / source.name
+        shutil.copy2(source, target)
+        target.chmod(0o644)
 
     run_command(["fc-cache", "-f"])
 
-    # Confirm that fontconfig resolves the requested family
-    # to the regular font installed for this job.
-    matched_file = run_command([
+    selected = run_command([
         "fc-match",
         "-f",
         "%{file}\n",
         family,
     ]).splitlines()[0]
 
-    expected_file = str((FONT_DIR / FONT_FILES[0].name).resolve())
+    expected = str(
+        (FONT_DIR / FONT_FILES[0].name).resolve()
+    )
 
-    if Path(matched_file).resolve() != Path(expected_file):
+    if Path(selected).resolve() != Path(expected).resolve():
         raise RuntimeError(
-            "Fontconfig did not select the installed IRMitra Regular font. "
-            f"Expected {expected_file}; received {matched_file}"
+            "Fontconfig did not select IRMitra Regular. "
+            "Expected: " + expected +
+            " Selected: " + selected
         )
 
-    print("Detected IRMitra internal family:", family)
+    print("Selected font family:", family)
 
-    for filename, detected_family in families.items():
-        print(f"{filename}: {detected_family}")
+    for filename, detected in families.items():
+        print(filename + " -> " + detected)
 
     return family
 
 
-def font_element(family):
-    escaped = html.escape(family, quote=True)
+def set_word_font(rpr, family):
+    """
+    Replace every WordprocessingML font reference
+    with the same explicit IRMitra family.
+    """
 
-    return (
-        '<w:rFonts'
-        f' w:ascii="{escaped}"'
-        f' w:hAnsi="{escaped}"'
-        f' w:eastAsia="{escaped}"'
-        f' w:cs="{escaped}"'
-        '/>'
+    for old in list(rpr.findall(W_RFonts)):
+        rpr.remove(old)
+
+    fonts = etree.Element(W_RFonts)
+
+    fonts.set(W + "ascii", family)
+    fonts.set(W + "hAnsi", family)
+    fonts.set(W + "eastAsia", family)
+    fonts.set(W + "cs", family)
+
+    # w:rFonts must be the first child of w:rPr.
+    rpr.insert(0, fonts)
+
+
+def force_word_fonts(root, family):
+    run_count = 0
+    property_count = 0
+    symbol_count = 0
+
+    # Apply direct font formatting to every text run.
+    # This is the DOCX-level equivalent of selecting all text
+    # and assigning IRMitra explicitly.
+    for run in root.iter(W_R):
+        rpr = run.find(W_RPR)
+
+        if rpr is None:
+            rpr = etree.Element(W_RPR)
+            run.insert(0, rpr)
+
+        set_word_font(rpr, family)
+        run_count += 1
+
+    # Also replace inherited style definitions:
+    # document defaults, paragraph styles, character styles,
+    # numbering levels and other run-property definitions.
+    for rpr in root.iter(W_RPR):
+        set_word_font(rpr, family)
+        property_count += 1
+
+    # Explicit symbol fonts can bypass normal rFonts settings.
+    for symbol in root.iter(W_SYM):
+        symbol.set(W + "font", family)
+        symbol_count += 1
+
+    return run_count, property_count, symbol_count
+
+
+def force_drawing_fonts(root, family):
+    changed = 0
+    run_count = 0
+
+    # Apply explicit font declarations to DrawingML text runs.
+    for run in root.iter(A_R):
+        rpr = run.find(A_RPR)
+
+        if rpr is None:
+            rpr = etree.Element(A_RPR)
+            run.insert(0, rpr)
+
+        set_drawing_font_properties(rpr, family)
+        run_count += 1
+
+    # Replace DrawingML font declarations everywhere:
+    # text boxes, charts, diagrams, SmartArt and theme fonts.
+    for element in root.iter():
+        if element.tag in A_FONT_ELEMENTS:
+            element.set("typeface", family)
+            changed += 1
+
+    # Update existing direct formatting containers too.
+    for element in root.iter():
+        if element.tag in {
+            A + "rPr",
+            A + "defRPr",
+            A + "endParaRPr",
+        }:
+            set_drawing_font_properties(element, family)
+
+    return changed, run_count
+
+
+def set_drawing_font_properties(element, family):
+    """
+    Replace existing DrawingML latin/east-Asian/complex-script
+    font declarations. Theme declarations are also overwritten.
+    """
+
+    for tag in (A + "latin", A + "ea", A + "cs"):
+        matches = element.findall(tag)
+
+        if matches:
+            for item in matches:
+                item.set("typeface", family)
+
+
+def force_math_font(root, family):
+    changed = 0
+
+    # Set the declared font for Office Math equations.
+    for element in root.iter(M + "mathFont"):
+        element.set(M + "val", family)
+        changed += 1
+
+    return changed
+
+
+def patch_xml(data, part_name, family):
+    parser = etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        recover=False,
+        remove_blank_text=False,
+        strip_cdata=False,
+        huge_tree=False,
     )
 
+    try:
+        root = etree.fromstring(data, parser)
+    except Exception as exc:
+        raise RuntimeError(
+            "XML parsing failed: " + part_name
+        ) from exc
 
-def patch_run_properties(xml_text, font_tag):
-    def replace_rpr(match):
-        attrs = match.group("attrs")
+    word_runs = 0
+    word_properties = 0
+    word_symbols = 0
+    drawing_fonts = 0
+    drawing_runs = 0
+    math_fonts = 0
 
-        if attrs is None:
-            attrs = match.group("selfattrs") or ""
+    if root.tag.startswith(W):
+        (
+            word_runs,
+            word_properties,
+            word_symbols,
+        ) = force_word_fonts(root, family)
 
-        body = match.group("body") or ""
+    drawing_fonts, drawing_runs = force_drawing_fonts(
+        root,
+        family
+    )
 
-        # Remove previous explicit and theme-based font declarations.
-        body = RFONTS_RE.sub("", body)
+    math_fonts = force_math_font(root, family)
 
-        # Place w:rFonts first in the run properties.
-        return (
-            "<w:rPr" + attrs + ">"
-            + font_tag
-            + body
-            + "</w:rPr>"
-        )
+    total = (
+        word_runs
+        + word_properties
+        + word_symbols
+        + drawing_fonts
+        + drawing_runs
+        + math_fonts
+    )
 
-    xml_text = RPR_RE.sub(replace_rpr, xml_text)
+    if not total:
+        return data, 0, 0, 0, 0, 0, 0
 
-    def add_missing_rpr(match):
-        attrs = match.group("attrs")
-        body = match.group("body")
+    has_declaration = data.lstrip().startswith(b"<?xml")
 
-        if re.search(r"<w:rPr(?=[\s>])", body):
-            return match.group(0)
+    patched = etree.tostring(
+        root,
+        encoding="UTF-8",
+        xml_declaration=has_declaration,
+        pretty_print=False,
+    )
 
-        return (
-            "<w:r" + attrs + ">"
-            + "<w:rPr>" + font_tag + "</w:rPr>"
-            + body
-            + "</w:r>"
-        )
+    # Validate the serialized XML before writing it to DOCX.
+    etree.fromstring(patched, parser)
 
-    xml_text = RUN_RE.sub(add_missing_rpr, xml_text)
-
-    return xml_text
+    return (
+        patched,
+        word_runs,
+        word_properties,
+        word_symbols,
+        drawing_fonts,
+        drawing_runs,
+        math_fonts,
+    )
 
 
 def patch_docx(family):
@@ -201,10 +354,17 @@ def patch_docx(family):
         raise RuntimeError("input.docx does not exist.")
 
     if not zipfile.is_zipfile(SOURCE):
-        raise RuntimeError("input.docx is not a valid ZIP archive.")
+        raise RuntimeError("Invalid DOCX archive.")
 
-    font_tag = font_element(family)
-    changed_parts = 0
+    totals = {
+        "parts": 0,
+        "word_runs": 0,
+        "word_properties": 0,
+        "word_symbols": 0,
+        "drawing_fonts": 0,
+        "drawing_runs": 0,
+        "math_fonts": 0,
+    }
 
     try:
         with zipfile.ZipFile(SOURCE, "r") as source_zip:
@@ -217,24 +377,37 @@ def patch_docx(family):
                 for item in source_zip.infolist():
                     data = source_zip.read(item.filename)
 
-                    if XML_PARTS.fullmatch(item.filename):
-                        try:
-                            xml_text = data.decode("utf-8")
-                        except UnicodeDecodeError as exc:
-                            raise RuntimeError(
-                                f"Unexpected XML encoding in {item.filename}"
-                            ) from exc
+                    # Process all XML parts under word/.
+                    # No restriction to document.xml alone.
+                    is_word_xml = (
+                        item.filename.startswith("word/")
+                        and item.filename.lower().endswith(".xml")
+                    )
 
-                        patched = patch_run_properties(
-                            xml_text,
-                            font_tag,
+                    if is_word_xml:
+                        (
+                            data,
+                            wr,
+                            wp,
+                            ws,
+                            df,
+                            dr,
+                            mf,
+                        ) = patch_xml(
+                            data,
+                            item.filename,
+                            family,
                         )
 
-                        # Validate that the modified XML remains well-formed.
-                        ET.fromstring(patched.encode("utf-8"))
+                        totals["word_runs"] += wr
+                        totals["word_properties"] += wp
+                        totals["word_symbols"] += ws
+                        totals["drawing_fonts"] += df
+                        totals["drawing_runs"] += dr
+                        totals["math_fonts"] += mf
 
-                        data = patched.encode("utf-8")
-                        changed_parts += 1
+                        if wr or wp or ws or df or dr or mf:
+                            totals["parts"] += 1
 
                     target_zip.writestr(item, data)
 
@@ -243,7 +416,7 @@ def patch_docx(family):
 
         if bad_member:
             raise RuntimeError(
-                f"Patched DOCX archive integrity failed: {bad_member}"
+                "DOCX integrity check failed: " + bad_member
             )
 
         os.replace(TEMP_DOCX, SOURCE)
@@ -253,12 +426,18 @@ def patch_docx(family):
             TEMP_DOCX.unlink()
         raise
 
-    print("Patched XML parts:", changed_parts)
-    print("DOCX font declarations were updated.")
+    print("Modified XML parts:", totals["parts"])
+    print("Word text runs:", totals["word_runs"])
+    print("Word run-property definitions:", totals["word_properties"])
+    print("Word symbol declarations:", totals["word_symbols"])
+    print("DrawingML font declarations:", totals["drawing_fonts"])
+    print("DrawingML text runs:", totals["drawing_runs"])
+    print("Office Math font declarations:", totals["math_fonts"])
+    print("Global IRMitra font enforcement completed.")
 
 
 def main():
-    family = install_and_check_fonts()
+    family = install_fonts()
     patch_docx(family)
 
 
