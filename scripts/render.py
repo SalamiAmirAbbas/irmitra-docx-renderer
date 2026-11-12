@@ -349,6 +349,203 @@ def patch_xml(data, part_name, family):
     )
 
 
+def ensure_do_not_expand_shift_return(data):
+    """
+    Preserve all paragraph and line-break structures.
+    Enable the OOXML compatibility flag that prevents
+    justification expansion on lines ending in Shift+Enter.
+    """
+
+    parser = etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        recover=False,
+        remove_blank_text=False,
+        strip_cdata=False,
+    )
+
+    try:
+        root = etree.fromstring(data, parser)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not parse word/settings.xml."
+        ) from exc
+
+    if root.tag != W + "settings":
+        raise RuntimeError(
+            "Unexpected root element in word/settings.xml."
+        )
+
+    compat_nodes = root.findall(W + "compat")
+
+    if len(compat_nodes) > 1:
+        raise RuntimeError(
+            "Multiple w:compat elements found. "
+            "Refusing to modify an ambiguous settings structure."
+        )
+
+    # Reuse the existing compatibility container.
+    if compat_nodes:
+        compat = compat_nodes[0]
+
+    else:
+        # Create one w:compat element at its correct
+        # position in the Word settings sequence.
+        compat = etree.Element(W + "compat")
+
+        math_ns = (
+            "{http://schemas.openxmlformats.org/"
+            "officeDocument/2006/math}"
+        )
+
+        settings_successors = {
+            W + name
+            for name in (
+                "docVars",
+                "rsids",
+                "uiCompat97To2003",
+                "attachedSchema",
+                "themeFontLang",
+                "clrSchemeMapping",
+                "doNotIncludeSubdocsInStats",
+                "doNotAutoCompressPictures",
+                "forceUpgrade",
+                "captions",
+                "readModeInkLockDown",
+                "smartTagType",
+                "shapeDefaults",
+                "doNotEmbedSmartTags",
+                "decimalSymbol",
+                "listSeparator",
+            )
+        }
+
+        settings_successors.add(math_ns + "mathPr")
+
+        insert_at = len(root)
+
+        for index, child in enumerate(root):
+            if child.tag in settings_successors:
+                insert_at = index
+                break
+
+        root.insert(insert_at, compat)
+
+    flag_tag = W + "doNotExpandShiftReturn"
+    existing = compat.findall(flag_tag)
+
+    changed = False
+
+    if existing:
+        # Enable the existing flag explicitly.
+        flag = existing[0]
+
+        old_value = flag.get(W + "val")
+
+        if old_value not in ("true", "1", "on"):
+            flag.set(W + "val", "true")
+            changed = True
+
+        # The schema allows only one instance.
+        for duplicate in existing[1:]:
+            compat.remove(duplicate)
+            changed = True
+
+    else:
+        flag = etree.Element(flag_tag)
+        flag.set(W + "val", "true")
+
+        # Existing CT_Compat sequence:
+        # doNotExpandShiftReturn comes after ulTrailSpace
+        # and before spacingInWholePoints and subsequent flags.
+        preceding = {
+            W + name
+            for name in (
+                "useSingleBorderforContiguousCells",
+                "wpJustification",
+                "noTabHangInd",
+                "noLeading",
+                "spaceForUL",
+                "noColumnBalance",
+                "balanceSingleByteDoubleByteWidth",
+                "noExtraLineSpacing",
+                "doNotLeaveBackslashAlone",
+                "ulTrailSpace",
+            )
+        }
+
+        following = {
+            W + name
+            for name in (
+                "spacingInWholePoints",
+                "lineWrapLikeWord6",
+                "printBodyTextBeforeHeader",
+                "printColBlack",
+                "doNotBreakWrappedTables",
+                "adjustLineHeightInTable",
+                "useFELayout",
+                "useNormalStyleForList",
+                "doNotUseIndentAsNumberingTabStop",
+                "useAltKinsokuLineBreakRules",
+                "allowSpaceOfSameStyleInTable",
+                "compatSetting",
+            )
+        }
+
+        first_following = next(
+            (
+                i
+                for i, child in enumerate(compat)
+                if child.tag in following
+            ),
+            None,
+        )
+
+        last_preceding = max(
+            (
+                i
+                for i, child in enumerate(compat)
+                if child.tag in preceding
+            ),
+            default=-1,
+        )
+
+        if (
+            first_following is not None
+            and last_preceding >= first_following
+        ):
+            raise RuntimeError(
+                "Existing w:compat children are not in schema order. "
+                "Refusing to reorder existing compatibility settings."
+            )
+
+        if first_following is not None:
+            insert_at = first_following
+
+        elif last_preceding >= 0:
+            insert_at = last_preceding + 1
+
+        else:
+            insert_at = len(compat)
+
+        compat.insert(insert_at, flag)
+        changed = True
+
+    had_declaration = data.lstrip().startswith(b"<?xml")
+
+    patched = etree.tostring(
+        root,
+        encoding="UTF-8",
+        xml_declaration=had_declaration,
+        pretty_print=False,
+    )
+
+    # Validate the resulting XML.
+    etree.fromstring(patched, parser)
+
+    return patched, changed
+
+
 def patch_docx(family):
     if not SOURCE.is_file():
         raise RuntimeError("input.docx does not exist.")
@@ -356,6 +553,7 @@ def patch_docx(family):
     if not zipfile.is_zipfile(SOURCE):
         raise RuntimeError("Invalid DOCX archive.")
 
+    
     totals = {
         "parts": 0,
         "word_runs": 0,
@@ -364,7 +562,10 @@ def patch_docx(family):
         "drawing_fonts": 0,
         "drawing_runs": 0,
         "math_fonts": 0,
+        "shift_return_setting": False,
     }
+
+    settings_part_found = False
 
     try:
         with zipfile.ZipFile(SOURCE, "r") as source_zip:
@@ -384,6 +585,7 @@ def patch_docx(family):
                         and item.filename.lower().endswith(".xml")
                     )
 
+                    
                     if is_word_xml:
                         (
                             data,
@@ -399,6 +601,19 @@ def patch_docx(family):
                             family,
                         )
 
+                        settings_changed = False
+
+                        # Apply the compatibility setting only
+                        # to the document settings part.
+                        if item.filename == "word/settings.xml":
+
+                            data, settings_changed = (
+                                ensure_do_not_expand_shift_return(data)
+                            )
+
+                            settings_part_found = True
+                            totals["shift_return_setting"] = True
+
                         totals["word_runs"] += wr
                         totals["word_properties"] += wp
                         totals["word_symbols"] += ws
@@ -406,10 +621,19 @@ def patch_docx(family):
                         totals["drawing_runs"] += dr
                         totals["math_fonts"] += mf
 
-                        if wr or wp or ws or df or dr or mf:
+                        if (
+                            wr or wp or ws or df or dr or mf
+                            or settings_changed
+                        ):
                             totals["parts"] += 1
 
                     target_zip.writestr(item, data)
+
+        if not settings_part_found:
+            raise RuntimeError(
+                "The exported DOCX does not contain word/settings.xml. "
+                "Rendering stopped without modifying paragraph structures."
+            )
 
         with zipfile.ZipFile(TEMP_DOCX, "r") as check_zip:
             bad_member = check_zip.testzip()
@@ -434,6 +658,11 @@ def patch_docx(family):
     print("DrawingML text runs:", totals["drawing_runs"])
     print("Office Math font declarations:", totals["math_fonts"])
     print("Global IRMitra font enforcement completed.")
+    print(
+        "Shift+Enter line justification protection:",
+        "ENABLED" if totals["shift_return_setting"] else "NOT SET"
+    )
+
 
 
 def main():
