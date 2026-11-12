@@ -1,0 +1,86 @@
+
+name: IRMitra DOCX to PDF
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Apps Script job ID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: irmitra-${{ inputs.job_id }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    name: Render PDF with IRMitra
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout renderer
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install rendering tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libreoffice-writer \
+            fontconfig \
+            poppler-utils \
+            python3-requests
+
+      - name: Download private DOCX and fonts
+        env:
+          BRIDGE_URL: ${{ secrets.APPS_SCRIPT_BRIDGE_URL }}
+          BRIDGE_SECRET: ${{ secrets.BRIDGE_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          python3 scripts/unpack.py
+
+      - name: Patch DOCX and install IRMitra fonts
+        run: |
+          mkdir -p out profile
+          python3 scripts/render.py
+
+      - name: Convert DOCX to PDF
+        run: |
+          libreoffice \
+            -env:UserInstallation=file://$PWD/profile \
+            --headless \
+            --convert-to pdf \
+            --outdir out \
+            input.docx
+
+          test -s out/input.pdf
+          test "$(head -c 5 out/input.pdf)" = "%PDF-"
+
+      - name: Inspect PDF fonts
+        run: |
+          pdffonts out/input.pdf
+
+      - name: Return PDF to Google Drive
+        if: success()
+        env:
+          BRIDGE_URL: ${{ secrets.APPS_SCRIPT_BRIDGE_URL }}
+          BRIDGE_SECRET: ${{ secrets.BRIDGE_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          python3 scripts/callback.py complete
+
+      - name: Report failure to Apps Script
+        if: ${{ failure() && hashFiles('scripts/callback.py') != '' }}
+        continue-on-error: true
+        env:
+          BRIDGE_URL: ${{ secrets.APPS_SCRIPT_BRIDGE_URL }}
+          BRIDGE_SECRET: ${{ secrets.BRIDGE_SECRET }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          python3 scripts/callback.py fail
