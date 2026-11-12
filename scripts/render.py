@@ -2525,7 +2525,7 @@ def process_docx(font_families, options):
         files.get("word/styles.xml")
     )
 
-    report = {
+        report = {
         "xmlPartsProcessed": 0,
         "wordRuns": 0,
         "wordRunProperties": 0,
@@ -2536,6 +2536,7 @@ def process_docx(font_families, options):
         "paragraphsFormatted": 0,
         "normalRunsRaised": 0,
         "shiftReturnProtection": False,
+        "paginationControls": None,
         "pageNumbers": None,
         "footnotes": None,
     }
@@ -2630,7 +2631,7 @@ def process_docx(font_families, options):
                 root,
                 original_data
             )
-        "paginationControls": None,
+
         report["xmlPartsProcessed"] += 1
 
     # The DOCX export normally contains settings.xml.
