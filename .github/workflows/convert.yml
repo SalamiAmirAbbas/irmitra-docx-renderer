@@ -35,7 +35,8 @@ jobs:
             libreoffice-writer \
             fontconfig \
             poppler-utils \
-            python3-requests
+            python3-requests \
+            python3-lxml
 
       - name: Download private DOCX and fonts
         env:
